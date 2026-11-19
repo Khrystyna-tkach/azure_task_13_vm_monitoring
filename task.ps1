@@ -12,6 +12,7 @@ $vmName = "matebox"
 $vmImage = "Ubuntu2204"
 $vmSize = "Standard_B1s"
 $dnsLabel = "matetask" + (Get-Random -Count 1) 
+$ErrorActionPreference = "Stop"
 
 Write-Host "Creating a resource group $resourceGroupName ..."
 New-AzResourceGroup -Name $resourceGroupName -Location $location
@@ -33,17 +34,100 @@ New-AzPublicIpAddress -Name $publicIpAddressName -ResourceGroupName $resourceGro
 
 Write-Host "Creating a VM ..."
 # Update the VM deployment command to enable a system-assigned mannaged identity on it. 
-New-AzVm `
--ResourceGroupName $resourceGroupName `
--Name $vmName `
--Location $location `
--image $vmImage `
--size $vmSize `
--SubnetName $subnetName `
--VirtualNetworkName $virtualNetworkName `
--SecurityGroupName $networkSecurityGroupName `
--SshKeyName $sshKeyName  -PublicIpAddressName $publicIpAddressName `
--SystemAssignedIdentity
+$existingVm = Get-AzVM `
+    -ResourceGroupName $resourceGroupName `
+    -Name $vmName `
+    -ErrorAction SilentlyContinue
+
+if (-not $existingVm) {
+
+    # Get network resources
+    $vnet = Get-AzVirtualNetwork `
+        -ResourceGroupName $resourceGroupName `
+        -Name $virtualNetworkName
+
+    $nsg = Get-AzNetworkSecurityGroup `
+        -ResourceGroupName $resourceGroupName `
+        -Name $networkSecurityGroupName
+
+    $publicIp = Get-AzPublicIpAddress `
+        -ResourceGroupName $resourceGroupName `
+        -Name $publicIpAddressName
+
+    $subnet = $vnet.Subnets |
+        Where-Object { $_.Name -eq $subnetName }
+
+    # Create network interface
+    $nic = New-AzNetworkInterface `
+        -Name "$vmName-nic" `
+        -ResourceGroupName $resourceGroupName `
+        -Location $location `
+        -SubnetId $subnet.Id `
+        -PublicIpAddressId $publicIp.Id `
+        -NetworkSecurityGroupId $nsg.Id
+
+    # Create VM configuration with Managed Identity
+    $vmConfig = New-AzVMConfig `
+        -VMName $vmName `
+        -VMSize $vmSize `
+        -SecurityType Standard `
+        -IdentityType SystemAssigned
+
+    # Configure Linux
+    $credential = Get-Credential -UserName "azureuser"
+
+    $vmConfig = Set-AzVMOperatingSystem `
+        -VM $vmConfig `
+        -Linux `
+        -ComputerName $vmName `
+        -Credential $credential `
+        -DisablePasswordAuthentication
+
+    # Ubuntu 22.04 image
+    $vmConfig = Set-AzVMSourceImage `
+        -VM $vmConfig `
+        -PublisherName "Canonical" `
+        -Offer "0001-com-ubuntu-server-jammy" `
+        -Skus "22_04-lts-gen2" `
+        -Version "latest"
+
+    # Configure OS disk
+    $vmConfig = Set-AzVMOSDisk `
+        -VM $vmConfig `
+        -Name "$vmName-osdisk" `
+        -CreateOption FromImage `
+        -StorageAccountType Standard_LRS `
+        -Linux
+
+    # Configure SSH key
+    $vmConfig = Add-AzVMSshPublicKey `
+        -VM $vmConfig `
+        -KeyData $sshKeyPublicKey `
+        -Path "/home/azureuser/.ssh/authorized_keys"
+
+    # Attach network interface
+    $vmConfig = Add-AzVMNetworkInterface `
+        -VM $vmConfig `
+        -Id $nic.Id
+
+    # Deploy VM
+    New-AzVM `
+        -ResourceGroupName $resourceGroupName `
+        -Location $location `
+        -VM $vmConfig `
+        -ErrorAction Stop
+}
+else {
+    Write-Host "VM already exists. Checking identity..."
+
+    if ($existingVm.Identity.Type -notmatch "SystemAssigned") {
+        Update-AzVM `
+            -ResourceGroupName $resourceGroupName `
+            -VM $existingVm `
+            -IdentityType SystemAssigned `
+            -ErrorAction Stop
+    }
+}
 
 Write-Host "Installing the TODO web app..."
 $Params = @{
